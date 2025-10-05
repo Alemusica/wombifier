@@ -661,8 +661,11 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         // --- Watery (modulated short delay/chorus) ---
         if (water > 0.0001) {
             double depth_samps = (0.25 + 0.75 * water) * 0.5 * base_samps; // up to ~0.5*base depth
-            double delayL = base_samps + sin(2.0 * M_PI * lfoL) * depth_samps;
-            double delayR = base_samps + stereo_samps + sin(2.0 * M_PI * lfoR) * depth_samps;
+            double stereo_offset = stereo_samps * 0.5; // keep average delay centred
+            if (stereo_offset > base_samps - 1.0)
+                stereo_offset = base_samps - 1.0; // avoid collapsing left delay
+            double delayL = base_samps - stereo_offset + sin(2.0 * M_PI * lfoL) * depth_samps;
+            double delayR = base_samps + stereo_offset + sin(2.0 * M_PI * lfoR) * depth_samps;
 
             double tapL = tap_delay(x->dlyL, size, wr, delayL);
             double tapR = tap_delay(x->dlyR, size, wr, delayR);
