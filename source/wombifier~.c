@@ -9,6 +9,7 @@
 #include "z_dsp.h"
 #include "ext_sysmem.h"  // Changed from sysmemory.h
 #include <math.h>
+#include <string.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -66,18 +67,20 @@ static void biquad_set_bp(t_biquad *b, double sr, double fc, double q) {
     double sinw0 = sin(w0);
     double alpha = sinw0 / (2.0 * q);
 
-    double b0 =  sinw0 * 0.5 * q;
-    double b1 =  0.0;
-    double b2 = -sinw0 * 0.5 * q;
-    double a0 =  1.0 + alpha;
+    double b0 = q * alpha;     // = sin(w0)/2
+    double b1 = 0.0;
+    double b2 = -q * alpha;
+    double a0 = 1.0 + alpha;
     double a1 = -2.0 * cosw0;
-    double a2 =  1.0 - alpha;
+    double a2 = 1.0 - alpha;
 
     b->b0 = b0 / a0;
     b->b1 = b1 / a0;
     b->b2 = b2 / a0;
     b->a1 = a1 / a0;
     b->a2 = a2 / a0;
+
+    biquad_clear(b);
 }
 
 // Add lowshelf for depth:
@@ -99,20 +102,110 @@ static void biquad_set_lowshelf(t_biquad *b, double sr, double fc, double db_gai
     b->a1 = a1/a0; b->a2 = a2/a0;
 }
 
-// ---------------------------- Oversampling Helper ----------------------------
-typedef struct _oversampler {
-    t_biquad up[2];   // 2x upsampling filters
-    t_biquad down[2]; // 2x downsampling filters
-    double z1, z2;    // holding samples
-} t_oversampler;
+// ----------------------------- FIR PrimeFIR-style ----------------------------
+typedef struct _fir {
+    double *taps;
+    int ntaps;
+    double *buf;
+    int idx;
+    int prime_mode;
+    double asym;
+    double gain_l1;
+    double gain_l2;
+} t_fir;
 
-static void oversampler_init(t_oversampler *o, double sr) {
-    // Higher quality anti-aliasing filters
-    biquad_set_lp(&o->up[0], sr*2, sr*0.45, 0.85);
-    biquad_set_lp(&o->up[1], sr*2, sr*0.45, 0.85);
-    biquad_set_lp(&o->down[0], sr*2, sr*0.45, 0.85);
-    biquad_set_lp(&o->down[1], sr*2, sr*0.45, 0.85);
-    o->z1 = o->z2 = 0.0;
+static int is_prime_i(int n) {
+    if (n < 2) return 0;
+    if (n % 2 == 0) return n == 2;
+    for (int k = 3; k * k <= n; k += 2) {
+        if (n % k == 0) return 0;
+    }
+    return 1;
+}
+
+static void fir_free(t_fir *f) {
+    if (f->taps) sysmem_freeptr(f->taps);
+    if (f->buf) sysmem_freeptr(f->buf);
+    memset(f, 0, sizeof(*f));
+}
+
+static void fir_init(t_fir *f, int ntaps) {
+    fir_free(f);
+    f->ntaps = (ntaps % 2 == 0) ? (ntaps + 1) : ntaps;
+    f->taps = (double *)sysmem_newptrclear(sizeof(double) * f->ntaps);
+    f->buf = (double *)sysmem_newptrclear(sizeof(double) * f->ntaps);
+    f->idx = 0;
+}
+
+static void fir_make_lowpass(t_fir *f, double sr, double fc, int prime_mode, double asym, int energy_norm) {
+    if (!f->taps || !f->buf) return;
+
+    int N = f->ntaps;
+    int M = N - 1;
+    double fc_n = fc / (sr * 0.5);
+    if (fc_n < 0.001) fc_n = 0.001;
+    if (fc_n > 0.999) fc_n = 0.999;
+
+    double center = M * (0.5 - 0.25 * asym);
+
+    const double a0 = 0.35875;
+    const double a1 = 0.48829;
+    const double a2 = 0.14128;
+    const double a3 = 0.01168;
+
+    double sumL1 = 0.0;
+    double sumL2 = 0.0;
+
+    for (int n = 0; n < N; ++n) {
+        double k = (double)n - center;
+        double x = M_PI * k * fc_n;
+
+        double sinc = (fabs(x) < 1e-12) ? fc_n : sin(x) / (M_PI * k);
+        double warg = (double)n / M;
+        double w = a0 - a1 * cos(2.0 * M_PI * warg) + a2 * cos(4.0 * M_PI * warg) - a3 * cos(6.0 * M_PI * warg);
+
+        double tap = sinc * w;
+        if (prime_mode && n != (int)round(center)) {
+            if (!is_prime_i(n)) tap = 0.0;
+        }
+
+        f->taps[n] = tap;
+        sumL1 += tap;
+        sumL2 += tap * tap;
+    }
+
+    if (energy_norm) {
+        double norm = sqrt(sumL2);
+        if (norm > 1e-15) {
+            for (int n = 0; n < N; ++n) f->taps[n] /= norm;
+        }
+        f->gain_l1 = 0.0;
+        f->gain_l2 = 1.0;
+    } else {
+        if (fabs(sumL1) < 1e-15) sumL1 = 1.0;
+        for (int n = 0; n < N; ++n) f->taps[n] /= sumL1;
+        f->gain_l1 = 1.0;
+        f->gain_l2 = 0.0;
+    }
+
+    memset(f->buf, 0, sizeof(double) * N);
+    f->idx = 0;
+    f->prime_mode = prime_mode;
+    f->asym = asym;
+}
+
+static inline double fir_process_1(t_fir *f, double x) {
+    if (!f->taps || !f->buf) return x;
+    int N = f->ntaps;
+    f->buf[f->idx] = x;
+    double y = 0.0;
+    int i = f->idx;
+    for (int n = 0; n < N; ++n) {
+        if (--i < 0) i += N;
+        y += f->taps[n] * f->buf[i];
+    }
+    if (++f->idx >= N) f->idx = 0;
+    return y;
 }
 
 // -------------------------- Resonator Bank -----------------------------
@@ -161,6 +254,7 @@ typedef struct _wombifier {
     double water_ms;   // base delay ms (default 12)
     double water_rate; // Hz     LFO rate (default 0.25)
     double stereo_ms;  // static extra delay on R channel (default 10)
+    double width;      // 0..1 stereo asymmetry (default 0)
 
     // new parameters
     double thickness; // 0..1 more body (default 0.3)
@@ -194,9 +288,6 @@ typedef struct _wombifier {
     // better noise generation
     t_biquad noise_filter[2];
 
-    // oversampling for clipper
-    t_oversampler osL, osR;
-
     // improved delay interpolation
     double dly_zm1[2]; // previous samples for interpolation
 
@@ -212,13 +303,24 @@ typedef struct _wombifier {
     // Research-based additions
     t_biquad mtf_filter[2];     // Maternal transfer function
     t_biquad voice_enhance[2];  // Maternal voice enhancement
-    
+    long use_mtf;
+    long use_mvoice;
+
     // HRV and respiratory modulation
     double hrv_phase;           // 0..1 slow HRV modulation
     double resp_phase;          // 0..1 respiratory phase
     double hrv_rate;           // Hz, typically 0.1 Hz (10s period)
     double resp_rate;          // Hz, typically 0.25 Hz (4s period)
-    
+
+    // FIR linear-phase filtering
+    t_fir firL, firR;
+    long use_fir;
+    long fir_ntaps;
+    double fir_asym;
+    long fir_prime;
+    long fir_energy_norm;
+    char fir_dirty;
+
     // Level monitoring
     double leq_acc;            // Accumulated energy for Leq
     double peak_level;         // Peak level tracking
@@ -231,10 +333,6 @@ t_class *wombifier_class;
 // --------------------------------- Helpers ----------------------------------
 static inline double clampd(double v, double lo, double hi) {
     return v < lo ? lo : (v > hi ? hi : v);
-}
-
-static inline double fast_pow3(double x) { // pow(x,3) but faster
-    return x * x * x;
 }
 
 static inline double softclip(double x, double amt) { // amt 0..1
@@ -251,12 +349,16 @@ static inline double rand_uniform(t_wombifier *x) { // [-1,1]
 }
 
 static double heart_env(t_wombifier *x, double phase) {
-    // Two Gaussian pulses per beat (lub-dub) — phase in [0,1)
-    double e1 = exp(-0.5 * pow((phase - x->gauss1_mu) / x->gauss1_sigma, 2.0));
-    double e2 = exp(-0.5 * pow((phase - x->gauss2_mu) / x->gauss2_sigma, 2.0)) * x->gauss2_gain;
-    double env = e1 + e2;            // ~0..1.7
-    if (env > 1.0) env = 1.0;        // soft-limit
-    return fast_pow3(env);           // accentuate peaks, calm the lows
+    double g1 = exp(-0.5 * pow((phase - x->gauss1_mu) / x->gauss1_sigma, 2.0));
+    double g2 = exp(-0.5 * pow((phase - x->gauss2_mu) / x->gauss2_sigma, 2.0)) * x->gauss2_gain;
+    double env = g1 + g2;
+
+    double area = 2.5066282746310002 * (x->gauss1_sigma + x->gauss2_sigma * x->gauss2_gain);
+    if (area > 1e-9) env /= area;
+
+    env = env / (1.0 + 0.5 * env);
+    if (env > 3.0) env = 3.0;
+    return env;
 }
 
 static void update_coeffs(t_wombifier *x, double cutoff_override) {
@@ -325,6 +427,11 @@ void wombifier_anything(t_wombifier *x, t_symbol *s, long argc, t_atom *argv);
 // attribute setters (need to refresh coeffs when cutoff/Q change)
 void wombifier_set_cutoff(t_wombifier *x, void *attr, long ac, t_atom *av);
 void wombifier_set_q(t_wombifier *x, void *attr, long ac, t_atom *av);
+void wombifier_set_fir_enable(t_wombifier *x, void *attr, long ac, t_atom *av);
+void wombifier_set_fir_ntaps(t_wombifier *x, void *attr, long ac, t_atom *av);
+void wombifier_set_fir_asym(t_wombifier *x, void *attr, long ac, t_atom *av);
+void wombifier_set_fir_prime(t_wombifier *x, void *attr, long ac, t_atom *av);
+void wombifier_set_fir_energy(t_wombifier *x, void *attr, long ac, t_atom *av);
 
 // ---------------------------------- Main ------------------------------------
 C74_EXPORT void ext_main(void *r) {
@@ -393,6 +500,10 @@ C74_EXPORT void ext_main(void *r) {
     CLASS_ATTR_LABEL(c,  "stereo_ms", 0, "Static Right Delay (ms)");
     CLASS_ATTR_FILTER_CLIP(c, "stereo_ms", 0.0, 20.0);
 
+    CLASS_ATTR_DOUBLE(c, "width", 0, t_wombifier, width);
+    CLASS_ATTR_LABEL(c,  "width", 0, "Stereo Width (0-1)");
+    CLASS_ATTR_FILTER_CLIP(c, "width", 0.0, 1.0);
+
     CLASS_ATTR_DOUBLE(c, "thickness", 0, t_wombifier, thickness);
     CLASS_ATTR_LABEL(c, "thickness", 0, "Body Thickness (0-1)");
     CLASS_ATTR_FILTER_CLIP(c, "thickness", 0.0, 1.0);
@@ -412,6 +523,39 @@ C74_EXPORT void ext_main(void *r) {
     CLASS_ATTR_DOUBLE(c, "dynamics", 0, t_wombifier, dynamics);
     CLASS_ATTR_LABEL(c, "dynamics", 0, "Dynamic Response (0-1)");
     CLASS_ATTR_FILTER_CLIP(c, "dynamics", 0.0, 1.0);
+
+    CLASS_ATTR_LONG(c, "mtf", 0, t_wombifier, use_mtf);
+    CLASS_ATTR_LABEL(c, "mtf", 0, "Enable Maternal Transfer (0/1)");
+    CLASS_ATTR_FILTER_CLIP(c, "mtf", 0, 1);
+
+    CLASS_ATTR_LONG(c, "mvoice", 0, t_wombifier, use_mvoice);
+    CLASS_ATTR_LABEL(c, "mvoice", 0, "Enable Maternal Voice Enhance (0/1)");
+    CLASS_ATTR_FILTER_CLIP(c, "mvoice", 0, 1);
+
+    CLASS_ATTR_LONG(c, "fir", 0, t_wombifier, use_fir);
+    CLASS_ATTR_LABEL(c, "fir", 0, "Enable Linear-Phase FIR (0/1)");
+    CLASS_ATTR_ACCESSORS(c, "fir", NULL, wombifier_set_fir_enable);
+    CLASS_ATTR_FILTER_CLIP(c, "fir", 0, 1);
+
+    CLASS_ATTR_LONG(c, "fir_ntaps", 0, t_wombifier, fir_ntaps);
+    CLASS_ATTR_LABEL(c, "fir_ntaps", 0, "FIR Taps (odd 129-4097)");
+    CLASS_ATTR_ACCESSORS(c, "fir_ntaps", NULL, wombifier_set_fir_ntaps);
+    CLASS_ATTR_FILTER_CLIP(c, "fir_ntaps", 129, 4097);
+
+    CLASS_ATTR_DOUBLE(c, "fir_asym", 0, t_wombifier, fir_asym);
+    CLASS_ATTR_LABEL(c, "fir_asym", 0, "FIR Asymmetry (0-1)");
+    CLASS_ATTR_ACCESSORS(c, "fir_asym", NULL, wombifier_set_fir_asym);
+    CLASS_ATTR_FILTER_CLIP(c, "fir_asym", 0.0, 1.0);
+
+    CLASS_ATTR_LONG(c, "fir_prime", 0, t_wombifier, fir_prime);
+    CLASS_ATTR_LABEL(c, "fir_prime", 0, "FIR Prime Mode (0/1)");
+    CLASS_ATTR_ACCESSORS(c, "fir_prime", NULL, wombifier_set_fir_prime);
+    CLASS_ATTR_FILTER_CLIP(c, "fir_prime", 0, 1);
+
+    CLASS_ATTR_LONG(c, "fir_energy", 0, t_wombifier, fir_energy_norm);
+    CLASS_ATTR_LABEL(c, "fir_energy", 0, "FIR Energy Normalization (0/1)");
+    CLASS_ATTR_ACCESSORS(c, "fir_energy", NULL, wombifier_set_fir_energy);
+    CLASS_ATTR_FILTER_CLIP(c, "fir_energy", 0, 1);
 
     class_register(CLASS_BOX, c);
     wombifier_class = c;
@@ -445,7 +589,8 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     x->water     = 0.35;
     x->water_ms  = 12.0;
     x->water_rate= 0.25;
-    x->stereo_ms = 10.0;
+    x->stereo_ms = 0.0;
+    x->width     = 0.0;
 
     x->thickness = 0.3;
     x->warmth = 0.3;
@@ -474,10 +619,6 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     biquad_set_lp(&x->noise_filter[0], x->sr, 600.0, 0.85);
     biquad_set_lp(&x->noise_filter[1], x->sr, 300.0, 0.75);
 
-    // Higher quality oversampling
-    oversampler_init(&x->osL, x->sr);
-    oversampler_init(&x->osR, x->sr);
-
     // Initialize resonators
     resonator_init(&x->resL, x->sr);
     resonator_init(&x->resR, x->sr);
@@ -487,6 +628,8 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     biquad_set_womb_response(&x->mtf_filter[1], x->sr);
     biquad_set_maternal_voice(&x->voice_enhance[0], x->sr);
     biquad_set_maternal_voice(&x->voice_enhance[1], x->sr);
+    x->use_mtf = 0;
+    x->use_mvoice = 0;
     
     // Initialize modulation rates
     x->hrv_rate = 0.1;   // 0.1 Hz for HRV
@@ -500,7 +643,17 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     x->leq_count = 0;
     
     x->dlyL = x->dlyR = NULL; x->dly_size = 0; x->wr_idx = 0;
-    x->lfoL = 0.0; x->lfoR = 0.33; // small phase offset for width
+    x->lfoL = 0.0; x->lfoR = 0.0;
+
+    memset(&x->firL, 0, sizeof(t_fir));
+    memset(&x->firR, 0, sizeof(t_fir));
+    x->use_fir = 0;
+    x->fir_ntaps = 513;
+    x->fir_asym = 0.3;
+    x->fir_prime = 0;
+    x->fir_energy_norm = 1;
+    x->fir_dirty = 1;
+
     ensure_delay(x);
 
     attr_args_process(x, (short)argc, argv); // apply @attrs from the object box
@@ -511,6 +664,8 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
 void wombifier_free(t_wombifier *x) {
     if (x->dlyL) sysmem_freeptr(x->dlyL);
     if (x->dlyR) sysmem_freeptr(x->dlyR);
+    fir_free(&x->firL);
+    fir_free(&x->firR);
     dsp_free((t_pxobject *)x);
 }
 
@@ -536,8 +691,6 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
     if (samplerate > 0) {
         if (samplerate != x->sr) {
             x->sr = samplerate;
-            oversampler_init(&x->osL, x->sr);
-            oversampler_init(&x->osR, x->sr);
             resonator_init(&x->resL, x->sr);
             resonator_init(&x->resR, x->sr);
             biquad_set_lp(&x->noise_filter[0], x->sr, 600.0, 0.85);
@@ -547,6 +700,7 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
             biquad_set_maternal_voice(&x->voice_enhance[0], x->sr);
             biquad_set_maternal_voice(&x->voice_enhance[1], x->sr);
             x->coeffs_dirty = 1;
+            x->fir_dirty = 1;
         } else {
             x->sr = samplerate;
         }
@@ -556,6 +710,20 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
 
     x->noise_g = 1.0 - exp(-2.0 * M_PI * (300.0 / x->sr));
     ensure_delay(x);
+    if (x->use_fir) {
+        if (!x->firL.taps || x->firL.ntaps != x->fir_ntaps) fir_init(&x->firL, (int)x->fir_ntaps);
+        if (!x->firR.taps || x->firR.ntaps != x->fir_ntaps) fir_init(&x->firR, (int)x->fir_ntaps);
+        if (x->firL.taps && (x->fir_dirty || x->firL.prime_mode != x->fir_prime || x->firL.asym != x->fir_asym)) {
+            fir_make_lowpass(&x->firL, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+        }
+        if (x->firR.taps && (x->fir_dirty || x->firR.prime_mode != x->fir_prime || x->firR.asym != x->fir_asym)) {
+            fir_make_lowpass(&x->firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+        }
+        x->fir_dirty = 0;
+    } else {
+        if (x->firL.taps) fir_free(&x->firL);
+        if (x->firR.taps) fir_free(&x->firR);
+    }
     if (x->coeffs_dirty) update_coeffs(x, 0.0);
     object_method(dsp64, gensym("dsp_add64"), x, wombifier_perform64, 0, NULL);
 }
@@ -593,8 +761,10 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     double water = clampd(x->water, 0.0, 1.0);
     double base_ms = clampd(x->water_ms, 1.0, 30.0);
     double rate = clampd(x->water_rate, 0.01, 5.0);
-    double stereo_ms = clampd(x->stereo_ms, 0.0, 20.0);
+    double width = clampd(x->width, 0.0, 1.0);
+    double stereo_ms = clampd(x->stereo_ms, 0.0, 20.0) * width;
     double lfo_inc = rate / sr; // cycles/sample
+    double lfo_incR = lfo_inc * (1.0 - 0.03 * width);
 
     long size = x->dly_size;
     long wr = x->wr_idx;
@@ -652,11 +822,19 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         // smooth toward target
         cutoff_s += 0.005 * (target_cut - cutoff_s);
         // refresh coeffs occasionally (every 16 samples)
-        if ((i & 15) == 0) update_coeffs(x, cutoff_s);
+        if (!x->use_fir && (i & 15) == 0) update_coeffs(x, cutoff_s);
 
-        // apply low-pass occlusion to modulated signal
-        double wl = biquad_process(&x->lpfL, l * mod + nval);
-        double wrs= biquad_process(&x->lpfR, r * mod + nval);
+        double mod_inL = l * mod + nval;
+        double mod_inR = r * mod + nval;
+        double wl;
+        double wrs;
+        if (x->use_fir) {
+            wl = fir_process_1(&x->firL, mod_inL);
+            wrs = fir_process_1(&x->firR, mod_inR);
+        } else {
+            wl = biquad_process(&x->lpfL, mod_inL);
+            wrs = biquad_process(&x->lpfR, mod_inR);
+        }
 
         // --- Watery (modulated short delay/chorus) ---
         if (water > 0.0001) {
@@ -687,34 +865,16 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         wr++; if (wr >= size) wr = 0;
 
         lfoL += lfo_inc; if (lfoL >= 1.0) lfoL -= 1.0;
-        lfoR += lfo_inc * 0.97; if (lfoR >= 1.0) lfoR -= 1.0; // slight rate offset for extra swirl
+        lfoR += lfo_incR; if (lfoR >= 1.0) lfoR -= 1.0;
 
         // Add thickness
         double thick = x->thickness * 0.7;
         wl = wl * (1.0 + thick * (1.0 - env));
         wrs = wrs * (1.0 + thick * (1.0 - env));
 
-        // Oversample before soft clipper
         if (soft > 0.0) {
-            // 2x oversampling
-            double wl2[2] = {wl, x->osL.z1};
-            double wr2[2] = {wrs, x->osR.z1};
-
-            for (int j = 0; j < 2; j++) {
-                wl2[j] = biquad_process(&x->osL.up[j], wl2[j]);
-                wr2[j] = biquad_process(&x->osR.up[j], wr2[j]);
-
-                wl2[j] = softclip(wl2[j], soft);
-                wr2[j] = softclip(wr2[j], soft);
-
-                wl2[j] = biquad_process(&x->osL.down[j], wl2[j]);
-                wr2[j] = biquad_process(&x->osR.down[j], wr2[j]);
-            }
-
-            wl = wl2[0];
-            wrs = wr2[0];
-            x->osL.z1 = wl2[1];
-            x->osR.z1 = wr2[1];
+            wl = softclip(wl, soft);
+            wrs = softclip(wrs, soft);
         }
 
         // Dynamic envelope following
@@ -727,7 +887,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
 
         // Process through resonators
         double res_amtL = x->bodyres * (0.7 + 0.3 * env);
-        double res_amtR = res_amtL * 0.97; // slight stereo variation
+        double res_amtR = res_amtL;
 
         wl = wl + resonator_process(&x->resL, wl) * res_amtL;
         wrs = wrs + resonator_process(&x->resR, wrs) * res_amtR;
@@ -740,10 +900,14 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         }
 
         // Apply research-based filtering
-        wl = biquad_process(&x->mtf_filter[0], wl);
-        wl = biquad_process(&x->voice_enhance[0], wl);
-        wrs = biquad_process(&x->mtf_filter[1], wrs);
-        wrs = biquad_process(&x->voice_enhance[1], wrs);
+        if (x->use_mtf) {
+            wl = biquad_process(&x->mtf_filter[0], wl);
+            wrs = biquad_process(&x->mtf_filter[1], wrs);
+        }
+        if (x->use_mvoice) {
+            wl = biquad_process(&x->voice_enhance[0], wl);
+            wrs = biquad_process(&x->voice_enhance[1], wrs);
+        }
 
         // Apply respiratory modulation
         wl *= resp_mod;
@@ -811,6 +975,7 @@ void wombifier_set_cutoff(t_wombifier *x, void *attr, long ac, t_atom *av) {
         x->cutoff = clampd(v, 40.0, 4000.0);
         x->cutoff_smooth = x->cutoff; // reset smooth target
         x->coeffs_dirty = 1;
+        x->fir_dirty = 1;
     }
 }
 
@@ -818,6 +983,52 @@ void wombifier_set_q(t_wombifier *x, void *attr, long ac, t_atom *av) {
     if (ac && av) {
         double v = atom_getfloat(av);
         x->q = clampd(v, 0.3, 8.0);
-        x->coeffs_dirty = 1; 
+        x->coeffs_dirty = 1;
+    }
+}
+
+void wombifier_set_fir_enable(t_wombifier *x, void *attr, long ac, t_atom *av) {
+    if (ac && av) {
+        long v = atom_getlong(av);
+        x->use_fir = v ? 1 : 0;
+        x->fir_dirty = 1;
+    }
+}
+
+void wombifier_set_fir_ntaps(t_wombifier *x, void *attr, long ac, t_atom *av) {
+    if (ac && av) {
+        long n = atom_getlong(av);
+        if (n < 129) n = 129;
+        if (n > 4097) n = 4097;
+        if ((n & 1) == 0) {
+            if (n < 4097) n += 1;
+            else n -= 1;
+        }
+        x->fir_ntaps = n;
+        x->fir_dirty = 1;
+    }
+}
+
+void wombifier_set_fir_asym(t_wombifier *x, void *attr, long ac, t_atom *av) {
+    if (ac && av) {
+        double v = atom_getfloat(av);
+        x->fir_asym = clampd(v, 0.0, 1.0);
+        x->fir_dirty = 1;
+    }
+}
+
+void wombifier_set_fir_prime(t_wombifier *x, void *attr, long ac, t_atom *av) {
+    if (ac && av) {
+        long v = atom_getlong(av);
+        x->fir_prime = v ? 1 : 0;
+        x->fir_dirty = 1;
+    }
+}
+
+void wombifier_set_fir_energy(t_wombifier *x, void *attr, long ac, t_atom *av) {
+    if (ac && av) {
+        long v = atom_getlong(av);
+        x->fir_energy_norm = v ? 1 : 0;
+        x->fir_dirty = 1;
     }
 }
