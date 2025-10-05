@@ -280,27 +280,31 @@ static void ensure_delay(t_wombifier *x) {
     }
 }
 
-static inline double tap_delay(double *buf, long size, long wr_idx, double delay_samps) {
-    // Improved interpolation for smoother delay
+static inline double tap_delay(const double *buf, long size, long wr_idx, double delay_samps) {
+    // Catmull-Rom interpolation for smooth delay taps
     if (delay_samps < 1.0) delay_samps = 1.0;
     if (delay_samps > size - 4) delay_samps = size - 4;
+
     double read_pos = (double)wr_idx - delay_samps;
     while (read_pos < 0.0) read_pos += size;
 
-    long i0 = (long)read_pos;
-    long i1 = i0 + 1; if (i1 >= size) i1 -= size;
+    long i1 = (long)read_pos;
+    long i0 = i1 - 1; if (i0 < 0) i0 += size;
     long i2 = i1 + 1; if (i2 >= size) i2 -= size;
-    
-    double frac = read_pos - (double)i0;
-    double a = buf[i0];
-    double b = buf[i1];
-    double c = buf[i2];
-    
-    // Cubic interpolation
-    double t = frac;
-    double t2 = t * t;
-    double t3 = t2 * t;
-    return a + 0.5 * (b - a) * t + (c - b - (b - a)) * t2 + ((b - a) - (c - b)) * t3;
+    long i3 = i2 + 1; if (i3 >= size) i3 -= size;
+
+    double frac = read_pos - (double)i1;
+    double a0 = buf[i0];
+    double a1 = buf[i1];
+    double a2 = buf[i2];
+    double a3 = buf[i3];
+
+    double c0 = a1;
+    double c1 = 0.5 * (a2 - a0);
+    double c2 = a0 - 2.5 * a1 + 2.0 * a2 - 0.5 * a3;
+    double c3 = -0.5 * a0 + 1.5 * a1 - 1.5 * a2 + 0.5 * a3;
+
+    return ((c3 * frac + c2) * frac + c1) * frac + c0;
 }
 
 // ---------------------------- Method prototypes -----------------------------
@@ -528,7 +532,28 @@ void wombifier_assist(t_wombifier *x, void *b, long m, long a, char *s) {
 
 // --------------------------------- DSP --------------------------------------
 void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags) {
-    if (samplerate > 0) x->sr = samplerate;
+    double prev_sr = x->sr;
+    if (samplerate > 0) {
+        if (samplerate != x->sr) {
+            x->sr = samplerate;
+            oversampler_init(&x->osL, x->sr);
+            oversampler_init(&x->osR, x->sr);
+            resonator_init(&x->resL, x->sr);
+            resonator_init(&x->resR, x->sr);
+            biquad_set_lp(&x->noise_filter[0], x->sr, 600.0, 0.85);
+            biquad_set_lp(&x->noise_filter[1], x->sr, 300.0, 0.75);
+            biquad_set_womb_response(&x->mtf_filter[0], x->sr);
+            biquad_set_womb_response(&x->mtf_filter[1], x->sr);
+            biquad_set_maternal_voice(&x->voice_enhance[0], x->sr);
+            biquad_set_maternal_voice(&x->voice_enhance[1], x->sr);
+            x->coeffs_dirty = 1;
+        } else {
+            x->sr = samplerate;
+        }
+    }
+
+    if (x->sr <= 0.0) x->sr = prev_sr > 0.0 ? prev_sr : 48000.0;
+
     x->noise_g = 1.0 - exp(-2.0 * M_PI * (300.0 / x->sr));
     ensure_delay(x);
     if (x->coeffs_dirty) update_coeffs(x, 0.0);
@@ -579,6 +604,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     // precompute base delays in samples
     double base_samps = (base_ms * 0.001) * sr;
     double stereo_samps = (stereo_ms * 0.001) * sr;
+    double feedback = clampd(x->feedback, 0.0, 0.3);
 
     // smoothing for dynamic cutoff
     double cutoff_s = x->cutoff_smooth;
@@ -633,36 +659,32 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         double wrs= biquad_process(&x->lpfR, r * mod + nval);
 
         // --- Watery (modulated short delay/chorus) ---
-        double dl = wl, dr = wrs;
         if (water > 0.0001) {
             double depth_samps = (0.25 + 0.75 * water) * 0.5 * base_samps; // up to ~0.5*base depth
             double delayL = base_samps + sin(2.0 * M_PI * lfoL) * depth_samps;
             double delayR = base_samps + stereo_samps + sin(2.0 * M_PI * lfoR) * depth_samps;
 
-            // write current filtered samples to delay buffers
-            x->dlyL[wr] = wl;
-            x->dlyR[wr] = wrs;
-
-            // read
             double tapL = tap_delay(x->dlyL, size, wr, delayL);
             double tapR = tap_delay(x->dlyR, size, wr, delayR);
 
-            // mix (simple chorus)
             double mix = 0.35 + 0.65 * water; // 0.35..1.0
-            dl = (1.0 - mix) * wl + mix * tapL;
-            dr = (1.0 - mix) * wrs + mix * tapR;
+            double wetL = (1.0 - mix) * wl + mix * tapL;
+            double wetR = (1.0 - mix) * wrs + mix * tapR;
 
-            // advance LFOs
-            lfoL += lfo_inc; if (lfoL >= 1.0) lfoL -= 1.0;
-            lfoR += lfo_inc * 0.97; if (lfoR >= 1.0) lfoR -= 1.0; // slight rate offset for extra swirl
+            x->dlyL[wr] = wl + tapL * feedback;
+            x->dlyR[wr] = wrs + tapR * feedback;
 
-            // advance write pointer
-            wr++; if (wr >= size) wr = 0;
+            wl = wetL;
+            wrs = wetR;
+        } else {
+            x->dlyL[wr] = wl;
+            x->dlyR[wr] = wrs;
         }
-        else {
-            // still write to keep buffers warm
-            x->dlyL[wr] = wl; x->dlyR[wr] = wrs; wr++; if (wr >= size) wr = 0;
-        }
+
+        wr++; if (wr >= size) wr = 0;
+
+        lfoL += lfo_inc; if (lfoL >= 1.0) lfoL -= 1.0;
+        lfoR += lfo_inc * 0.97; if (lfoR >= 1.0) lfoR -= 1.0; // slight rate offset for extra swirl
 
         // Add thickness
         double thick = x->thickness * 0.7;
@@ -740,8 +762,8 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         }
 
         // wet/dry
-        double ol = dl * wet + l * (1.0 - wet);
-        double orr = dr * wet + r * (1.0 - wet);
+        double ol = wl * wet + l * (1.0 - wet);
+        double orr = wrs * wet + r * (1.0 - wet);
 
         // safety clamp
         if (ol > 1.0) ol = 1.0; else if (ol < -1.0) ol = -1.0;
