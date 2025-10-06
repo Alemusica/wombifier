@@ -708,7 +708,7 @@ void wombifier_free(t_wombifier *x) {
     fir_free(&x->firL);
     fir_free(&x->firR);
     if (x->fir_qelem) qelem_free(x->fir_qelem);
-    critical_free(&x->fir_lock);
+    critical_free(x->fir_lock);
     dsp_free((t_pxobject *)x);
 }
 
@@ -749,9 +749,9 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
 
 void wombifier_fir_qfn(t_wombifier *x) {
     if (!x) return;
-    critical_enter(&x->fir_lock);
+    critical_enter(x->fir_lock);
     fir_rebuild_if_needed(x);
-    critical_exit(&x->fir_lock);
+    critical_exit(x->fir_lock);
 }
 
 void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double samplerate,
@@ -784,9 +784,9 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
 
     ensure_delay(x);
     if (x->coeffs_dirty) update_coeffs(x, 0.0);
-    critical_enter(&x->fir_lock);
+    critical_enter(x->fir_lock);
     fir_rebuild_if_needed(x);
-    critical_exit(&x->fir_lock);
+    critical_exit(x->fir_lock);
 
     object_method(dsp64, gensym("dsp_add64"), x, wombifier_perform64, 0, NULL);
 }
@@ -838,7 +838,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     double cutoff_s = x->cutoff_smooth;
 
     const int fir_ready = (x->use_fir && !x->fir_dirty && x->firL.taps && x->firR.taps);
-    if (fir_ready) critical_enter(&x->fir_lock);
+    if (fir_ready) critical_enter(x->fir_lock);
 
     for (long i = 0; i < n; ++i) {
         // heartbeat
@@ -978,7 +978,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     x->cutoff_smooth = cutoff_s;
     x->wr_idx = wr;
     x->lfoL = lfoL; x->lfoR = lfoR;
-    if (fir_ready) critical_exit(&x->fir_lock);
+    if (fir_ready) critical_exit(x->fir_lock);
 }
 
 // --------------------------- Anything handler --------------------------------
