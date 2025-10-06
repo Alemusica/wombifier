@@ -172,12 +172,30 @@ static void fir_make_lowpass(t_fir *f, double sr, double fc,
         double tap = sinc * w;
 
         if (prime_mode && n != cidx) {
-            if (!is_prime_i(n)) tap = 0.0; // sparsificazione su indici non-primi
+            int mirror = M - n;
+            if (!(is_prime_i(n) || is_prime_i(mirror))) {
+                tap = 0.0;
+            }
         }
 
         f->taps[n] = tap;
         sumL1 += tap;
         sumL2 += tap * tap;
+    }
+
+    if (prime_mode) {
+        for (int n = 0; n < N/2; ++n) {
+            int m = M - n;
+            double avg = 0.5 * (f->taps[n] + f->taps[m]);
+            f->taps[n] = f->taps[m] = avg;
+        }
+        sumL1 = 0.0;
+        sumL2 = 0.0;
+        for (int n = 0; n < N; ++n) {
+            double tap = f->taps[n];
+            sumL1 += tap;
+            sumL2 += tap * tap;
+        }
     }
 
     // Normalizzazione
@@ -274,6 +292,7 @@ typedef struct _wombifier {
     double feedback;   // 0..0.3
     double dynamics;   // 0..1
     double width;      // 0..1 stereo width (0 = perfetta simmetria)
+    long   mono;       // forza input mono
 
     // dsp state
     double sr;
@@ -520,6 +539,9 @@ C74_EXPORT void ext_main(void *r) {
     CLASS_ATTR_LABEL (c, "width", 0, "Stereo Width (0-1)");
     CLASS_ATTR_FILTER_CLIP(c, "width", 0.0, 1.0);
 
+    CLASS_ATTR_LONG (c, "mono", 0, t_wombifier, mono);
+    CLASS_ATTR_LABEL(c, "mono", 0, "Force Mono Input (0/1)");
+
     // FIR attrs
     CLASS_ATTR_LONG (c, "fir", 0, t_wombifier, use_fir);
     CLASS_ATTR_LABEL(c, "fir", 0, "Enable FIR (0/1)");
@@ -583,6 +605,7 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     x->feedback  = 0.12;
     x->dynamics  = 0.25;
     x->width     = 0.0;  // perfetta simmetria di default
+    x->mono      = 0;
 
     x->env_follow = 0.0;
     x->env_smooth = 0.99;
@@ -777,6 +800,11 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         double l = inL ? inL[i] : 0.0;
         double r = inR ? inR[i] : 0.0;
 
+        if (x->mono) {
+            double m = 0.5 * (l + r);
+            l = r = m;
+        }
+
         // noise (ben filtrato)
         double wn = rand_uniform_pm1(&x->rng);
         wn = biquad_process(&x->noise_filter[0], wn);
@@ -907,5 +935,25 @@ void wombifier_anything(t_wombifier *x, t_symbol *s, long argc, t_atom *argv) {
         }
         return;
     }
+
+    if (!strcmp(name, "cutoff") && argc)      { wombifier_set_cutoff(x, NULL, 1, argv); return; }
+    if (!strcmp(name, "q") && argc)           { wombifier_set_q(x, NULL, 1, argv); return; }
+
+    if (!strcmp(name, "fir") && argc)         { object_attr_setvalueof((t_object*)x, gensym("fir"), 1, argv); return; }
+    if (!strcmp(name, "fir_prime") && argc)   { wombifier_set_fir_prime(x, NULL, 1, argv); return; }
+    if (!strcmp(name, "fir_ntaps") && argc)   { wombifier_set_fir_ntaps(x, NULL, 1, argv); return; }
+    if (!strcmp(name, "fir_asym") && argc)    { wombifier_set_fir_asym(x, NULL, 1, argv); return; }
+    if (!strcmp(name, "fir_energy") && argc)  { wombifier_set_fir_energy(x, NULL, 1, argv); return; }
+
+    if (!strcmp(name, "width") && argc)    { object_attr_setvalueof((t_object*)x, gensym("width"), 1, argv); return; }
+    if (!strcmp(name, "water") && argc)    { object_attr_setvalueof((t_object*)x, gensym("water"), 1, argv); return; }
+    if (!strcmp(name, "soft") && argc)     { object_attr_setvalueof((t_object*)x, gensym("soft"), 1, argv); return; }
+    if (!strcmp(name, "bodyres") && argc)  { object_attr_setvalueof((t_object*)x, gensym("bodyres"), 1, argv); return; }
+    if (!strcmp(name, "warmth") && argc)   { object_attr_setvalueof((t_object*)x, gensym("warmth"), 1, argv); return; }
+    if (!strcmp(name, "water_ms") && argc) { object_attr_setvalueof((t_object*)x, gensym("water_ms"), 1, argv); return; }
+    if (!strcmp(name, "water_rate") && argc) { object_attr_setvalueof((t_object*)x, gensym("water_rate"), 1, argv); return; }
+    if (!strcmp(name, "stereo_ms") && argc)  { object_attr_setvalueof((t_object*)x, gensym("stereo_ms"), 1, argv); return; }
+    if (!strcmp(name, "mono") && argc)       { object_attr_setvalueof((t_object*)x, gensym("mono"), 1, argv); return; }
+
     object_post((t_object *)x, "Unknown message '%s'", s->s_name);
 }
