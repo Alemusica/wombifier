@@ -8,6 +8,7 @@
 #include "ext_obex.h"
 #include "z_dsp.h"
 #include "ext_sysmem.h"
+#include "ext_critical.h"
 #include <math.h>
 #include <string.h>
 
@@ -46,6 +47,7 @@ static void biquad_set_lp(t_biquad *b, double sr, double cutoff, double q) {
 
 static inline double biquad_process(t_biquad *b, double x) {
     double y = b->b0 * x + b->b1 * b->x1 + b->b2 * b->x2 - b->a1 * b->y1 - b->a2 * b->y2;
+    y += 1e-24; y -= 1e-24; // denormal guard
     b->x2 = b->x1; b->x1 = x;
     b->y2 = b->y1; b->y1 = y;
     return y;
@@ -358,6 +360,8 @@ typedef struct _wombifier {
     long   fir_energy_norm;// 0=DC norm, 1=energy norm
     t_fir  firL, firR;
     char   fir_dirty;
+    t_qelem *fir_qelem;
+    t_critical fir_lock;
 
 } t_wombifier;
 
@@ -372,6 +376,7 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
 void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long n, long flags, void *userparam);
 void wombifier_anything(t_wombifier *x, t_symbol *s, long argc, t_atom *argv);
 void wombifier_set_fir_enabled(t_wombifier *x, void *attr, long ac, t_atom *av);
+void wombifier_fir_qfn(t_wombifier *x);
 
 static void biquad_set_womb_response(t_biquad *b, double sr) {
     // opzionale: forte attenuazione sopra 1k
@@ -433,6 +438,7 @@ void wombifier_set_cutoff(t_wombifier *x, void *attr, long ac, t_atom *av) {
         x->cutoff_smooth = x->cutoff;
         x->coeffs_dirty = 1;
         x->fir_dirty = 1; // FIR dipende dal cutoff
+        if (x->fir_qelem) qelem_set(x->fir_qelem);
     }
 }
 void wombifier_set_q(t_wombifier *x, void *attr, long ac, t_atom *av) {
@@ -448,6 +454,7 @@ void wombifier_set_fir_enabled(t_wombifier *x, void *attr, long ac, t_atom *av) 
         if (x->use_fir != v) {
             x->use_fir = v;
             x->fir_dirty = 1;
+            if (x->fir_qelem) qelem_set(x->fir_qelem);
         } else {
             x->use_fir = v;
         }
@@ -460,16 +467,17 @@ void wombifier_set_fir_ntaps(t_wombifier *x, void *attr, long ac, t_atom *av) {
         if (v < 129) v = 129; if (v > 4097) v = 4097;
         x->fir_ntaps = v | 1; // forza dispari
         x->fir_dirty = 1;
+        if (x->fir_qelem) qelem_set(x->fir_qelem);
     }
 }
 void wombifier_set_fir_asym(t_wombifier *x, void *attr, long ac, t_atom *av) {
-    if (ac && av) { x->fir_asym = clampd(atom_getfloat(av), 0.0, 1.0); x->fir_dirty = 1; }
+    if (ac && av) { x->fir_asym = clampd(atom_getfloat(av), 0.0, 1.0); x->fir_dirty = 1; if (x->fir_qelem) qelem_set(x->fir_qelem); }
 }
 void wombifier_set_fir_prime(t_wombifier *x, void *attr, long ac, t_atom *av) {
-    if (ac && av) { x->fir_prime = atom_getlong(av) ? 1 : 0; x->fir_dirty = 1; }
+    if (ac && av) { x->fir_prime = atom_getlong(av) ? 1 : 0; x->fir_dirty = 1; if (x->fir_qelem) qelem_set(x->fir_qelem); }
 }
 void wombifier_set_fir_energy(t_wombifier *x, void *attr, long ac, t_atom *av) {
-    if (ac && av) { x->fir_energy_norm = atom_getlong(av) ? 1 : 0; x->fir_dirty = 1; }
+    if (ac && av) { x->fir_energy_norm = atom_getlong(av) ? 1 : 0; x->fir_dirty = 1; if (x->fir_qelem) qelem_set(x->fir_qelem); }
 }
 
 // ---------------------------------- Main ------------------------------------
@@ -686,6 +694,8 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     x->fir_dirty      = 1;
     x->firL.taps = x->firR.taps = NULL;
     x->firL.buf  = x->firR.buf  = NULL;
+    x->fir_qelem = qelem_new((t_object *)x, (method)wombifier_fir_qfn);
+    x->fir_lock  = critical_new();
 
     attr_args_process(x, (short)argc, argv); // allow @attrs in object box
 
@@ -697,6 +707,8 @@ void wombifier_free(t_wombifier *x) {
     if (x->dlyR) sysmem_freeptr(x->dlyR);
     fir_free(&x->firL);
     fir_free(&x->firR);
+    if (x->fir_qelem) qelem_free(x->fir_qelem);
+    if (x->fir_lock) critical_free(x->fir_lock);
     dsp_free((t_pxobject *)x);
 }
 
@@ -735,6 +747,13 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
     x->fir_dirty = 0;
 }
 
+void wombifier_fir_qfn(t_wombifier *x) {
+    if (!x) return;
+    if (x->fir_lock) critical_enter(x->fir_lock);
+    fir_rebuild_if_needed(x);
+    if (x->fir_lock) critical_exit(x->fir_lock);
+}
+
 void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double samplerate,
                      long maxvectorsize, long flags) {
     double prev_sr = x->sr;
@@ -765,7 +784,9 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
 
     ensure_delay(x);
     if (x->coeffs_dirty) update_coeffs(x, 0.0);
+    if (x->fir_lock) critical_enter(x->fir_lock);
     fir_rebuild_if_needed(x);
+    if (x->fir_lock) critical_exit(x->fir_lock);
 
     object_method(dsp64, gensym("dsp_add64"), x, wombifier_perform64, 0, NULL);
 }
@@ -816,11 +837,8 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
 
     double cutoff_s = x->cutoff_smooth;
 
-    int use_fir = (x->use_fir != 0);
-    if (use_fir && x->fir_dirty) {
-        // rarissimo, ma al bisogno
-        fir_rebuild_if_needed(x);
-    }
+    const int fir_ready = (x->use_fir && !x->fir_dirty && x->firL.taps && x->firR.taps);
+    if (fir_ready && x->fir_lock) critical_enter(x->fir_lock);
 
     for (long i = 0; i < n; ++i) {
         // heartbeat
@@ -855,7 +873,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         double sR = r * mod + nval;
 
         // Occlusione: FIR (linear-phase, prime-mode) oppure IIR LP dinamico
-        if (use_fir) {
+        if (fir_ready) {
             // FIR statico sul cutoff corrente (perfetto e naturale)
             sL = fir_process_1(&x->firL, sL);
             sR = fir_process_1(&x->firR, sR);
@@ -864,7 +882,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
             double target_cut = x->cutoff * (0.85 + 0.5 * cutmod * env);
             target_cut = clampd(target_cut, 40.0, sr * 0.45);
             cutoff_s += 0.005 * (target_cut - cutoff_s);
-            if ((i & 15) == 0) update_coeffs(x, cutoff_s);
+            if (i == 0 || x->coeffs_dirty) update_coeffs(x, cutoff_s);
             sL = biquad_process(&x->lpfL, sL);
             sR = biquad_process(&x->lpfR, sR);
         }
@@ -881,9 +899,11 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
             double tapL = tap_delay(x->dlyL, size, wr, delayL);
             double tapR = tap_delay(x->dlyR, size, wr, delayR);
 
-            double mix = 0.35 + 0.65 * water;
-            double wetL = (1.0 - mix) * sL + mix * tapL;
-            double wetR = (1.0 - mix) * sR + mix * tapR;
+            double theta = water * (M_PI * 0.5);
+            double dryg  = cos(theta);
+            double wetg  = sin(theta);
+            double wetL = dryg * sL + wetg * tapL;
+            double wetR = dryg * sR + wetg * tapR;
 
             x->dlyL[wr] = sL + tapL * feedback;
             x->dlyR[wr] = sR + tapR * feedback;
@@ -958,6 +978,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     x->cutoff_smooth = cutoff_s;
     x->wr_idx = wr;
     x->lfoL = lfoL; x->lfoR = lfoR;
+    if (fir_ready && x->fir_lock) critical_exit(x->fir_lock);
 }
 
 // --------------------------- Anything handler --------------------------------
