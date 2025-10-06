@@ -138,12 +138,21 @@ static void fir_free(t_fir *f) {
     memset(f, 0, sizeof(*f));
 }
 
-static void fir_init(t_fir *f, int ntaps) {
-    fir_free(f);
-    f->ntaps = (ntaps % 2 == 0) ? (ntaps + 1) : ntaps; // forziamo dispari
-    f->taps  = (double*)sysmem_newptrclear(sizeof(double) * f->ntaps);
-    f->buf   = (double*)sysmem_newptrclear(sizeof(double) * f->ntaps);
-    f->idx   = 0;
+static void fir_prepare(t_fir *f, int ntaps) {
+    int wanted = (ntaps % 2 == 0) ? (ntaps + 1) : ntaps;
+    if (wanted < 3) wanted = 3;
+
+    if (!f->taps || !f->buf || f->ntaps != wanted) {
+        if (f->taps) sysmem_freeptr(f->taps);
+        if (f->buf)  sysmem_freeptr(f->buf);
+        f->taps = (double*)sysmem_newptrclear(sizeof(double) * wanted);
+        f->buf  = (double*)sysmem_newptrclear(sizeof(double) * wanted);
+        f->ntaps = wanted;
+    } else {
+        memset(f->buf, 0, sizeof(double) * f->ntaps);
+    }
+
+    f->idx = 0;
 }
 
 static void fir_make_lowpass(t_fir *f, double sr, double fc,
@@ -317,6 +326,8 @@ typedef struct _wombifier {
     long wr_idx;
     double lfoL, lfoR;
 
+    char  in_connected[2]; // signal inlet connection flags
+
     // resonators
     t_resonator resL, resR;
 
@@ -360,6 +371,7 @@ void wombifier_assist(t_wombifier *x, void *b, long m, long a, char *s);
 void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags);
 void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long n, long flags, void *userparam);
 void wombifier_anything(t_wombifier *x, t_symbol *s, long argc, t_atom *argv);
+void wombifier_set_fir_enabled(t_wombifier *x, void *attr, long ac, t_atom *av);
 
 static void biquad_set_womb_response(t_biquad *b, double sr) {
     // opzionale: forte attenuazione sopra 1k
@@ -428,6 +440,17 @@ void wombifier_set_q(t_wombifier *x, void *attr, long ac, t_atom *av) {
         double v = atom_getfloat(av);
         x->q = clampd(v, 0.3, 8.0);
         x->coeffs_dirty = 1;
+    }
+}
+void wombifier_set_fir_enabled(t_wombifier *x, void *attr, long ac, t_atom *av) {
+    if (ac && av) {
+        long v = atom_getlong(av) ? 1 : 0;
+        if (x->use_fir != v) {
+            x->use_fir = v;
+            x->fir_dirty = 1;
+        } else {
+            x->use_fir = v;
+        }
     }
 }
 // FIR setters -> marcano fir_dirty
@@ -545,6 +568,7 @@ C74_EXPORT void ext_main(void *r) {
     // FIR attrs
     CLASS_ATTR_LONG (c, "fir", 0, t_wombifier, use_fir);
     CLASS_ATTR_LABEL(c, "fir", 0, "Enable FIR (0/1)");
+    CLASS_ATTR_ACCESSORS(c, "fir", NULL, wombifier_set_fir_enabled);
 
     CLASS_ATTR_LONG (c, "fir_ntaps", 0, t_wombifier, fir_ntaps);
     CLASS_ATTR_LABEL(c, "fir_ntaps", 0, "FIR Taps (odd, 129..4097)");
@@ -650,6 +674,7 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     // delay
     x->dlyL = x->dlyR = NULL; x->dly_size = 0; x->wr_idx = 0;
     x->lfoL = 0.0; x->lfoR = 0.0; // stesse fasi per simmetria
+    x->in_connected[0] = x->in_connected[1] = 0;
     ensure_delay(x);
 
     // FIR defaults — già pronti per "filtro numeri primi"
@@ -693,20 +718,32 @@ void wombifier_assist(t_wombifier *x, void *b, long m, long a, char *s) {
 
 // --------------------------------- DSP --------------------------------------
 static void fir_rebuild_if_needed(t_wombifier *x) {
-    if (!x->use_fir) return;
-    if (x->fir_dirty || !x->firL.taps || !x->firR.taps ||
-        x->firL.ntaps != x->fir_ntaps || x->firR.ntaps != x->fir_ntaps) {
-        fir_init(&x->firL, x->fir_ntaps);
-        fir_init(&x->firR, x->fir_ntaps);
-        fir_make_lowpass(&x->firL, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
-        fir_make_lowpass(&x->firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+    if (!x->use_fir) {
         x->fir_dirty = 0;
+        return;
     }
+
+    if (!(x->fir_dirty || !x->firL.taps || !x->firR.taps ||
+          x->firL.ntaps != x->fir_ntaps || x->firR.ntaps != x->fir_ntaps)) {
+        return;
+    }
+
+    fir_prepare(&x->firL, (int)x->fir_ntaps);
+    fir_prepare(&x->firR, (int)x->fir_ntaps);
+    fir_make_lowpass(&x->firL, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+    fir_make_lowpass(&x->firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+    x->fir_dirty = 0;
 }
 
 void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double samplerate,
                      long maxvectorsize, long flags) {
     double prev_sr = x->sr;
+    if (count) {
+        x->in_connected[0] = (char)(count[0] != 0);
+        x->in_connected[1] = (char)(count[1] != 0);
+    } else {
+        x->in_connected[0] = x->in_connected[1] = 0;
+    }
     if (samplerate > 0 && samplerate != x->sr) {
         x->sr = samplerate;
         x->noise_g = 1.0 - exp(-2.0 * M_PI * (300.0 / x->sr));
@@ -798,7 +835,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
 
         // input
         double l = inL ? inL[i] : 0.0;
-        double r = inR ? inR[i] : 0.0;
+        double r = (x->in_connected[1] && inR) ? inR[i] : l;
 
         if (x->mono) {
             double m = 0.5 * (l + r);
