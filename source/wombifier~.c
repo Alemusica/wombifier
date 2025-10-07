@@ -835,6 +835,10 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
     int inactive;
 
     critical_enter(&x->fir_lock);
+    if (x->fir_swap_pending) {
+        critical_exit(&x->fir_lock);
+        return;
+    }
     if (!x->use_fir) {
         x->fir_dirty = 0;
         x->fir_ready = 0;
@@ -1144,7 +1148,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         double mix_dry_r = dry_r;
         int use_dry_delay = 0;
         if (wet < 1.0 && fir_ready && firL) {
-            int gd = firL->ntaps >> 1;
+            int gd = (firL->ntaps - 1) >> 1;
             if (gd < 0) gd = 0;
             if (x->dry_size < gd + 8) ensure_dry_delay(x, gd + 16);
             if (x->dryBufL && x->dryBufR && x->dry_size > 0) {
