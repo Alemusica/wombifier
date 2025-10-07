@@ -281,9 +281,8 @@ static inline double fir_process_1(t_fir *f, double x) {
     int idx = f->idx;
     if (f->use_sparse && f->sp_nnz > 0) {
         for (int k = 0; k < f->sp_nnz; ++k) {
-            int n = f->sp_idx[k];
-            int j = idx - n;
-            if (j < 0) j += N;
+            int j = idx - f->sp_idx[k];
+            j += (j >> 31) & N;
             y += f->sp_val[k] * f->buf[j];
         }
     } else {
@@ -809,17 +808,25 @@ void wombifier_assist(t_wombifier *x, void *b, long m, long a, char *s) {
 
 // --------------------------------- DSP --------------------------------------
 static void fir_rebuild_if_needed(t_wombifier *x) {
+    int inactive;
+
+    critical_enter(x->fir_lock);
     if (!x->use_fir) {
         x->fir_dirty = 0;
         x->fir_ready = 0;
+        x->fir_swap_pending = 0;
+        critical_exit(x->fir_lock);
         return;
     }
 
     if (!x->fir_dirty && x->fir_ready) {
+        critical_exit(x->fir_lock);
         return;
     }
 
-    int inactive = x->fir_active ^ 1;
+    inactive = x->fir_active ^ 1;
+    critical_exit(x->fir_lock);
+
     t_fir *firL = &x->firL[inactive];
     t_fir *firR = &x->firR[inactive];
 
@@ -828,17 +835,24 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
     fir_make_lowpass(firL, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
     fir_make_lowpass(firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
 
+    critical_enter(x->fir_lock);
+    if (!x->use_fir) {
+        x->fir_dirty = 0;
+        x->fir_ready = 0;
+        x->fir_swap_pending = 0;
+        critical_exit(x->fir_lock);
+        return;
+    }
     x->fir_pending = inactive;
     x->fir_swap_pending = 1;
     x->fir_ready = 1;
     x->fir_dirty = 0;
+    critical_exit(x->fir_lock);
 }
 
 void wombifier_fir_qfn(t_wombifier *x) {
     if (!x) return;
-    critical_enter(x->fir_lock);
     fir_rebuild_if_needed(x);
-    critical_exit(x->fir_lock);
 }
 
 void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double samplerate,
@@ -871,9 +885,7 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
 
     ensure_delay(x);
     if (x->coeffs_dirty) update_coeffs(x, 0.0);
-    critical_enter(x->fir_lock);
     fir_rebuild_if_needed(x);
-    critical_exit(x->fir_lock);
 
     object_method(dsp64, gensym("dsp_add64"), x, wombifier_perform64, 0, NULL);
 }
@@ -1054,13 +1066,13 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         sL *= resp_mod; sR *= resp_mod;
 
         // Level monitoring + safety
-        double inst_level = 0.5 * (sL*sL + sR*sR);
-        x->leq_acc += inst_level; x->leq_count++;
-        if (inst_level > x->peak_level) x->peak_level = inst_level;
+        double inst_pow = 0.5 * (sL*sL + sR*sR);
+        x->leq_acc += inst_pow; x->leq_count++;
+        if (inst_pow > x->peak_level) x->peak_level = inst_pow;
 
-        double safety_limit = 0.707; // -3 dB
-        if (inst_level > safety_limit) {
-            double scale = sqrt(safety_limit / inst_level);
+        const double safety_pow = 0.5; // -3 dB power
+        if (inst_pow > safety_pow) {
+            double scale = sqrt(safety_pow / inst_pow);
             sL *= scale; sR *= scale;
         }
 
