@@ -425,6 +425,13 @@ typedef struct _wombifier {
     char   fir_swap_pending;
     char   fir_ready;
     char   fir_dirty;
+    char   fir_edit;
+    t_clock *fir_clk;
+    long   fir_debounce_ms;
+    int    fir_xfade_len;
+    int    fir_xfade_cnt;
+    int    fir_prev;
+    int    fir_next;
     t_qelem *fir_qelem;
     t_critical fir_lock;
     short in_conn[2]; // stato connessione ingressi
@@ -519,8 +526,12 @@ void wombifier_set_cutoff(t_wombifier *x, void *attr, long ac, t_atom *av) {
         x->cutoff = clampd(v, 40.0, 4000.0);
         x->cutoff_smooth = x->cutoff;
         x->coeffs_dirty = 1;
-        x->fir_dirty = 1; // FIR dipende dal cutoff
-        if (x->fir_qelem) qelem_set(x->fir_qelem);
+        x->fir_dirty = 1;
+        x->fir_edit = 1;
+        if (x->fir_clk)
+            clock_delay(x->fir_clk, x->fir_debounce_ms);
+        else if (x->fir_qelem)
+            qelem_set(x->fir_qelem);
     }
 }
 void wombifier_set_q(t_wombifier *x, void *attr, long ac, t_atom *av) {
@@ -541,6 +552,8 @@ void wombifier_set_fir_enabled(t_wombifier *x, void *attr, long ac, t_atom *av) 
             } else {
                 x->fir_ready = 0;
                 x->fir_swap_pending = 0;
+                x->fir_xfade_cnt = 0;
+                x->fir_edit = 0;
             }
         } else {
             x->use_fir = v;
@@ -779,20 +792,27 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
 
     // FIR defaults — già pronti per "filtro numeri primi"
     x->use_fir        = 1;
-    x->fir_ntaps      = 513;
-    x->fir_prime      = 1;
-    x->fir_asym       = 0.3;
-    x->fir_energy_norm= 0; // DC normalization (= area costante)
+    x->fir_ntaps      = 2049;
+    x->fir_prime      = 0;
+    x->fir_asym       = 0.0;
+    x->fir_energy_norm= 1; // energy normalization per attenuazione uniforme
     x->fir_dirty      = 1;
     x->fir_ready      = 0;
     x->fir_active     = 0;
     x->fir_pending    = 0;
     x->fir_swap_pending = 0;
+    x->fir_edit       = 0;
+    x->fir_debounce_ms = 80;
+    x->fir_xfade_len  = 256;
+    x->fir_xfade_cnt  = 0;
+    x->fir_prev       = 0;
+    x->fir_next       = 0;
     for (int i = 0; i < 2; ++i) {
         memset(&x->firL[i], 0, sizeof(t_fir));
         memset(&x->firR[i], 0, sizeof(t_fir));
     }
     x->fir_qelem = qelem_new((t_object *)x, (method)wombifier_fir_qfn);
+    x->fir_clk = clock_new((t_object *)x, (method)wombifier_fir_qfn);
     critical_new(&x->fir_lock);
 
     attr_args_process(x, (short)argc, argv); // allow @attrs in object box
@@ -810,6 +830,10 @@ void wombifier_free(t_wombifier *x) {
         fir_free(&x->firR[i]);
     }
     if (x->fir_qelem) qelem_free(x->fir_qelem);
+    if (x->fir_clk) {
+        clock_unset(x->fir_clk);
+        object_free((t_object *)x->fir_clk);
+    }
     critical_free(&x->fir_lock);
     dsp_free((t_pxobject *)x);
 }
@@ -839,6 +863,8 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
         x->fir_dirty = 0;
         x->fir_ready = 0;
         x->fir_swap_pending = 0;
+        x->fir_xfade_cnt = 0;
+        x->fir_edit = 0;
         critical_exit(&x->fir_lock);
         return;
     }
@@ -878,6 +904,8 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
         x->fir_dirty = 0;
         x->fir_ready = 0;
         x->fir_swap_pending = 0;
+        x->fir_xfade_cnt = 0;
+        x->fir_edit = 0;
         critical_exit(&x->fir_lock);
         return;
     }
@@ -885,6 +913,7 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
     x->fir_swap_pending = 1;
     x->fir_ready = 1;
     x->fir_dirty = 0;
+    x->fir_edit = 0;
     critical_exit(&x->fir_lock);
 }
 
@@ -980,7 +1009,16 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     if (x->use_fir) {
         critical_enter(&x->fir_lock);
         if (x->fir_swap_pending) {
-            x->fir_active = x->fir_pending;
+            if (x->fir_xfade_len > 0 && x->fir_ready) {
+                x->fir_prev = x->fir_active;
+                x->fir_next = x->fir_pending;
+                x->fir_xfade_cnt = x->fir_xfade_len;
+            } else {
+                x->fir_active = x->fir_pending;
+                x->fir_prev = x->fir_active;
+                x->fir_next = x->fir_active;
+                x->fir_xfade_cnt = 0;
+            }
             x->fir_swap_pending = 0;
         }
         int active = x->fir_active;
@@ -1025,10 +1063,33 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         double sR = r * mod + nval;
 
         // Occlusione: FIR (linear-phase, prime-mode) oppure IIR LP dinamico
-        if (fir_ready) {
-            // FIR statico sul cutoff corrente (perfetto e naturale)
-            sL = fir_process_1(firL, sL);
-            sR = fir_process_1(firR, sR);
+        int fir_do_now = (fir_ready && !x->fir_edit);
+
+        if (fir_do_now) {
+            double yL, yR;
+            if (x->fir_xfade_cnt > 0 && x->fir_xfade_len > 0) {
+                double a = (double)x->fir_xfade_cnt / (double)x->fir_xfade_len;
+                t_fir *fir_prevL = &x->firL[x->fir_prev];
+                t_fir *fir_prevR = &x->firR[x->fir_prev];
+                t_fir *fir_nextL = &x->firL[x->fir_next];
+                t_fir *fir_nextR = &x->firR[x->fir_next];
+                double yL_old = fir_process_1(fir_prevL, sL);
+                double yL_new = fir_process_1(fir_nextL, sL);
+                double yR_old = fir_process_1(fir_prevR, sR);
+                double yR_new = fir_process_1(fir_nextR, sR);
+                yL = yL_old * a + yL_new * (1.0 - a);
+                yR = yR_old * a + yR_new * (1.0 - a);
+                if (--x->fir_xfade_cnt == 0) {
+                    x->fir_active = x->fir_next;
+                    firL = &x->firL[x->fir_active];
+                    firR = &x->firR[x->fir_active];
+                }
+            } else {
+                yL = fir_process_1(firL, sL);
+                yR = fir_process_1(firR, sR);
+            }
+            sL = yL;
+            sR = yR;
         } else {
             // IIR: cutoff mod dal battito + smoothing + refresh periodico
             double target_cut = x->cutoff * (0.85 + 0.5 * cutmod * env);
@@ -1143,7 +1204,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         double mix_dry_l = dry_l;
         double mix_dry_r = dry_r;
         int use_dry_delay = 0;
-        if (wet < 1.0 && fir_ready && firL) {
+        if (wet < 1.0 && fir_do_now && firL) {
             int gd = firL->ntaps >> 1;
             if (gd < 0) gd = 0;
             if (x->dry_size < gd + 8) ensure_dry_delay(x, gd + 16);
