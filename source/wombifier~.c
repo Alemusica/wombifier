@@ -427,6 +427,11 @@ typedef struct _wombifier {
     char   fir_dirty;
     t_qelem *fir_qelem;
     t_critical fir_lock;
+    short in_conn[2]; // stato connessione ingressi
+    // dry-path delay per allineare il mix con FIR
+    double *dryBufL, *dryBufR;
+    long    dry_size;
+    long    dry_wr;
 
 } t_wombifier;
 
@@ -462,6 +467,18 @@ static void ensure_delay(t_wombifier *x) {
         x->dlyR = (double *)sysmem_newptrclear(sizeof(double) * need);
         x->dly_size = need;
         x->wr_idx = 0;
+    }
+}
+
+static void ensure_dry_delay(t_wombifier *x, long need) {
+    if (need < 64) need = 64;
+    if (need != x->dry_size) {
+        if (x->dryBufL) sysmem_freeptr(x->dryBufL);
+        if (x->dryBufR) sysmem_freeptr(x->dryBufR);
+        x->dryBufL = (double *)sysmem_newptrclear(sizeof(double) * need);
+        x->dryBufR = (double *)sysmem_newptrclear(sizeof(double) * need);
+        x->dry_size = need;
+        x->dry_wr = 0;
     }
 }
 
@@ -755,6 +772,8 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
 
     // delay
     x->dlyL = x->dlyR = NULL; x->dly_size = 0; x->wr_idx = 0;
+    x->dryBufL = x->dryBufR = NULL; x->dry_size = 0; x->dry_wr = 0;
+    x->in_conn[0] = 0; x->in_conn[1] = 0;
     x->lfoL = 0.0; x->lfoR = 0.0; // stesse fasi per simmetria
     ensure_delay(x);
 
@@ -784,6 +803,8 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
 void wombifier_free(t_wombifier *x) {
     if (x->dlyL) sysmem_freeptr(x->dlyL);
     if (x->dlyR) sysmem_freeptr(x->dlyR);
+    if (x->dryBufL) sysmem_freeptr(x->dryBufL);
+    if (x->dryBufR) sysmem_freeptr(x->dryBufR);
     for (int i = 0; i < 2; ++i) {
         fir_free(&x->firL[i]);
         fir_free(&x->firR[i]);
@@ -899,6 +920,8 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
     }
 
     ensure_delay(x);
+    x->in_conn[0] = count ? count[0] : 0;
+    x->in_conn[1] = count ? count[1] : 0;
     if (x->coeffs_dirty) update_coeffs(x, 0.0);
     fir_rebuild_if_needed(x);
 
@@ -980,7 +1003,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
 
         // input
         const double in_l = inL ? inL[i] : 0.0;
-        const double in_r = inR ? inR[i] : in_l;
+        const double in_r = (x->mono || !x->in_conn[1]) ? in_l : (inR ? inR[i] : in_l);
         double l = in_l;
         double r = in_r;
 
@@ -1115,8 +1138,39 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         }
 
         // wet/dry + clamp
-        double ol = sL * wet + l * (1.0 - wet);
-        double orr= sR * wet + r * (1.0 - wet);
+        double dry_l = l;
+        double dry_r = r;
+        double mix_dry_l = dry_l;
+        double mix_dry_r = dry_r;
+        int use_dry_delay = 0;
+        if (wet < 1.0 && fir_ready && firL) {
+            int gd = firL->ntaps >> 1;
+            if (gd < 0) gd = 0;
+            if (x->dry_size < gd + 8) ensure_dry_delay(x, gd + 16);
+            if (x->dryBufL && x->dryBufR && x->dry_size > 0) {
+                long rd = x->dry_wr - gd;
+                while (rd < 0) rd += x->dry_size;
+                mix_dry_l = x->dryBufL[rd];
+                mix_dry_r = x->dryBufR[rd];
+                use_dry_delay = 1;
+            }
+        }
+
+        double ol, orr;
+        if (use_dry_delay) {
+            ol = sL * wet + mix_dry_l * (1.0 - wet);
+            orr= sR * wet + mix_dry_r * (1.0 - wet);
+        } else {
+            ol = sL * wet + dry_l * (1.0 - wet);
+            orr= sR * wet + dry_r * (1.0 - wet);
+        }
+
+        if (x->dryBufL && x->dryBufR && x->dry_size > 0) {
+            x->dryBufL[x->dry_wr] = dry_l;
+            x->dryBufR[x->dry_wr] = dry_r;
+            if (++x->dry_wr >= x->dry_size) x->dry_wr = 0;
+        }
+
         if (ol >  1.0) ol =  1.0; else if (ol < -1.0) ol = -1.0;
         if (orr>  1.0) orr=  1.0; else if (orr< -1.0) orr= -1.0;
 
