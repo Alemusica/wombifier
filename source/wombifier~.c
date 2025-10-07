@@ -121,11 +121,17 @@ static inline double resonator_process(t_resonator *r, double in) {
 // -------------------------- FIR PrimeFIR-like --------------------------------
 // Sinc finestrato Blackman-Harris con possibilità di usare solo indici PRIMI
 typedef struct _fir {
-    double *taps;  // coeff
-    int ntaps;     // dispari
-    double *buf;   // ring buffer
-    int idx;
-    double gain_l1, gain_l2;
+    double *taps;      // coefficienti densi
+    int     ntaps;     // numero di tap attivi
+    int     taps_cap;  // capacità allocata per taps
+    double *buf;       // ring buffer
+    int     buf_cap;   // capacità allocata per buf
+    int     idx;
+    double  gain_l1, gain_l2;
+    char    use_sparse;
+    int    *sp_idx;    // indici non nulli (per prime-mode)
+    double *sp_val;    // valori corrispondenti
+    int     sp_nnz;    // numero di coefficienti non nulli
 } t_fir;
 
 static int is_prime_i(int n) {
@@ -137,6 +143,8 @@ static int is_prime_i(int n) {
 static void fir_free(t_fir *f) {
     if (f->taps) sysmem_freeptr(f->taps);
     if (f->buf)  sysmem_freeptr(f->buf);
+    if (f->sp_idx) sysmem_freeptr(f->sp_idx);
+    if (f->sp_val) sysmem_freeptr(f->sp_val);
     memset(f, 0, sizeof(*f));
 }
 
@@ -144,17 +152,22 @@ static void fir_prepare(t_fir *f, int ntaps) {
     int wanted = (ntaps % 2 == 0) ? (ntaps + 1) : ntaps;
     if (wanted < 3) wanted = 3;
 
-    if (!f->taps || !f->buf || f->ntaps != wanted) {
+    if (!f->taps || f->taps_cap != wanted) {
         if (f->taps) sysmem_freeptr(f->taps);
-        if (f->buf)  sysmem_freeptr(f->buf);
-        f->taps = (double*)sysmem_newptrclear(sizeof(double) * wanted);
-        f->buf  = (double*)sysmem_newptrclear(sizeof(double) * wanted);
-        f->ntaps = wanted;
-    } else {
-        memset(f->buf, 0, sizeof(double) * f->ntaps);
+        f->taps = (double*)sysmem_newptr(sizeof(double) * wanted);
+        f->taps_cap = wanted;
     }
-
+    if (!f->buf || f->buf_cap != wanted) {
+        if (f->buf) sysmem_freeptr(f->buf);
+        f->buf = (double*)sysmem_newptrclear(sizeof(double) * wanted);
+        f->buf_cap = wanted;
+    } else {
+        memset(f->buf, 0, sizeof(double) * f->buf_cap);
+    }
+    f->ntaps = wanted;
     f->idx = 0;
+    f->use_sparse = 0;
+    f->sp_nnz = 0;
 }
 
 static void fir_make_lowpass(t_fir *f, double sr, double fc,
@@ -222,18 +235,67 @@ static void fir_make_lowpass(t_fir *f, double sr, double fc,
 
     memset(f->buf, 0, sizeof(double)*N);
     f->idx = 0;
+    if (prime_mode) {
+        int nnz = 0;
+        for (int n = 0; n < N; ++n) if (fabs(f->taps[n]) > 1e-12) nnz++;
+        if (f->sp_idx) { sysmem_freeptr(f->sp_idx); f->sp_idx = NULL; }
+        if (f->sp_val) { sysmem_freeptr(f->sp_val); f->sp_val = NULL; }
+        if (nnz > 0) {
+            f->sp_idx = (int *)sysmem_newptr(sizeof(int) * nnz);
+            f->sp_val = (double *)sysmem_newptr(sizeof(double) * nnz);
+            if (f->sp_idx && f->sp_val) {
+                int k = 0;
+                for (int n = 0; n < N; ++n) {
+                    double tap = f->taps[n];
+                    if (fabs(tap) > 1e-12) {
+                        f->sp_idx[k] = n;
+                        f->sp_val[k] = tap;
+                        ++k;
+                    }
+                }
+                f->sp_nnz = nnz;
+                f->use_sparse = 1;
+            } else {
+                if (f->sp_idx) { sysmem_freeptr(f->sp_idx); f->sp_idx = NULL; }
+                if (f->sp_val) { sysmem_freeptr(f->sp_val); f->sp_val = NULL; }
+                f->sp_nnz = 0;
+                f->use_sparse = 0;
+            }
+        } else {
+            f->sp_nnz = 0;
+            f->use_sparse = 0;
+        }
+    } else {
+        if (f->sp_idx) { sysmem_freeptr(f->sp_idx); f->sp_idx = NULL; }
+        if (f->sp_val) { sysmem_freeptr(f->sp_val); f->sp_val = NULL; }
+        f->sp_nnz = 0;
+        f->use_sparse = 0;
+    }
 }
 
 static inline double fir_process_1(t_fir *f, double x) {
     int N = f->ntaps;
+    if (!N) return x;
     f->buf[f->idx] = x;
     double y = 0.0;
-    int i = f->idx;
-    for (int n = 0; n < N; ++n) {
-        if (--i < 0) i += N;
-        y += f->taps[n] * f->buf[i];
+    int idx = f->idx;
+    if (f->use_sparse && f->sp_nnz > 0) {
+        for (int k = 0; k < f->sp_nnz; ++k) {
+            int n = f->sp_idx[k];
+            int j = idx - n;
+            if (j < 0) j += N;
+            y += f->sp_val[k] * f->buf[j];
+        }
+    } else {
+        const double *taps = f->taps;
+        int i = idx;
+        for (int n = 0; n < N; ++n) {
+            y += taps[n] * f->buf[i];
+            if (--i < 0) i += N;
+        }
     }
-    if (++f->idx >= N) f->idx = 0;
+    if (++idx >= N) idx = 0;
+    f->idx = idx;
     return y;
 }
 
@@ -358,7 +420,11 @@ typedef struct _wombifier {
     long   fir_prime;      // 0/1 only primes
     double fir_asym;       // 0..1
     long   fir_energy_norm;// 0=DC norm, 1=energy norm
-    t_fir  firL, firR;
+    t_fir  firL[2], firR[2];
+    int    fir_active;
+    int    fir_pending;
+    char   fir_swap_pending;
+    char   fir_ready;
     char   fir_dirty;
     t_qelem *fir_qelem;
     t_critical fir_lock;
@@ -453,8 +519,13 @@ void wombifier_set_fir_enabled(t_wombifier *x, void *attr, long ac, t_atom *av) 
         long v = atom_getlong(av) ? 1 : 0;
         if (x->use_fir != v) {
             x->use_fir = v;
-            x->fir_dirty = 1;
-            if (x->fir_qelem) qelem_set(x->fir_qelem);
+            if (x->use_fir) {
+                x->fir_dirty = 1;
+                if (x->fir_qelem) qelem_set(x->fir_qelem);
+            } else {
+                x->fir_ready = 0;
+                x->fir_swap_pending = 0;
+            }
         } else {
             x->use_fir = v;
         }
@@ -692,8 +763,14 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     x->fir_asym       = 0.3;
     x->fir_energy_norm= 0; // DC normalization (= area costante)
     x->fir_dirty      = 1;
-    x->firL.taps = x->firR.taps = NULL;
-    x->firL.buf  = x->firR.buf  = NULL;
+    x->fir_ready      = 0;
+    x->fir_active     = 0;
+    x->fir_pending    = 0;
+    x->fir_swap_pending = 0;
+    for (int i = 0; i < 2; ++i) {
+        memset(&x->firL[i], 0, sizeof(t_fir));
+        memset(&x->firR[i], 0, sizeof(t_fir));
+    }
     x->fir_qelem = qelem_new((t_object *)x, (method)wombifier_fir_qfn);
     critical_new(&x->fir_lock);
 
@@ -705,8 +782,10 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
 void wombifier_free(t_wombifier *x) {
     if (x->dlyL) sysmem_freeptr(x->dlyL);
     if (x->dlyR) sysmem_freeptr(x->dlyR);
-    fir_free(&x->firL);
-    fir_free(&x->firR);
+    for (int i = 0; i < 2; ++i) {
+        fir_free(&x->firL[i]);
+        fir_free(&x->firR[i]);
+    }
     if (x->fir_qelem) qelem_free(x->fir_qelem);
     critical_free(x->fir_lock);
     dsp_free((t_pxobject *)x);
@@ -732,18 +811,26 @@ void wombifier_assist(t_wombifier *x, void *b, long m, long a, char *s) {
 static void fir_rebuild_if_needed(t_wombifier *x) {
     if (!x->use_fir) {
         x->fir_dirty = 0;
+        x->fir_ready = 0;
         return;
     }
 
-    if (!(x->fir_dirty || !x->firL.taps || !x->firR.taps ||
-          x->firL.ntaps != x->fir_ntaps || x->firR.ntaps != x->fir_ntaps)) {
+    if (!x->fir_dirty && x->fir_ready) {
         return;
     }
 
-    fir_prepare(&x->firL, (int)x->fir_ntaps);
-    fir_prepare(&x->firR, (int)x->fir_ntaps);
-    fir_make_lowpass(&x->firL, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
-    fir_make_lowpass(&x->firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+    int inactive = x->fir_active ^ 1;
+    t_fir *firL = &x->firL[inactive];
+    t_fir *firR = &x->firR[inactive];
+
+    fir_prepare(firL, (int)x->fir_ntaps);
+    fir_prepare(firR, (int)x->fir_ntaps);
+    fir_make_lowpass(firL, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+    fir_make_lowpass(firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
+
+    x->fir_pending = inactive;
+    x->fir_swap_pending = 1;
+    x->fir_ready = 1;
     x->fir_dirty = 0;
 }
 
@@ -837,8 +924,21 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
 
     double cutoff_s = x->cutoff_smooth;
 
-    const int fir_ready = (x->use_fir && !x->fir_dirty && x->firL.taps && x->firR.taps);
-    if (fir_ready) critical_enter(x->fir_lock);
+    t_fir *firL = NULL;
+    t_fir *firR = NULL;
+    int fir_ready = 0;
+    if (x->use_fir) {
+        critical_enter(x->fir_lock);
+        if (x->fir_swap_pending) {
+            x->fir_active = x->fir_pending;
+            x->fir_swap_pending = 0;
+        }
+        int active = x->fir_active;
+        firL = &x->firL[active];
+        firR = &x->firR[active];
+        fir_ready = (x->fir_ready && firL->taps && firR->taps && firL->ntaps > 0 && firR->ntaps > 0);
+        critical_exit(x->fir_lock);
+    }
 
     for (long i = 0; i < n; ++i) {
         // heartbeat
@@ -875,8 +975,8 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         // Occlusione: FIR (linear-phase, prime-mode) oppure IIR LP dinamico
         if (fir_ready) {
             // FIR statico sul cutoff corrente (perfetto e naturale)
-            sL = fir_process_1(&x->firL, sL);
-            sR = fir_process_1(&x->firR, sR);
+            sL = fir_process_1(firL, sL);
+            sR = fir_process_1(firR, sR);
         } else {
             // IIR: cutoff mod dal battito + smoothing + refresh periodico
             double target_cut = x->cutoff * (0.85 + 0.5 * cutmod * env);
@@ -978,7 +1078,6 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     x->cutoff_smooth = cutoff_s;
     x->wr_idx = wr;
     x->lfoL = lfoL; x->lfoR = lfoR;
-    if (fir_ready) critical_exit(x->fir_lock);
 }
 
 // --------------------------- Anything handler --------------------------------
