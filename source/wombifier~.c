@@ -812,22 +812,22 @@ void wombifier_assist(t_wombifier *x, void *b, long m, long a, char *s) {
 static void fir_rebuild_if_needed(t_wombifier *x) {
     int inactive;
 
-    critical_enter(x->fir_lock);
+    critical_enter(&x->fir_lock);
     if (!x->use_fir) {
         x->fir_dirty = 0;
         x->fir_ready = 0;
         x->fir_swap_pending = 0;
-        critical_exit(x->fir_lock);
+        critical_exit(&x->fir_lock);
         return;
     }
 
     if (!x->fir_dirty && x->fir_ready) {
-        critical_exit(x->fir_lock);
+        critical_exit(&x->fir_lock);
         return;
     }
 
     inactive = x->fir_active ^ 1;
-    critical_exit(x->fir_lock);
+    critical_exit(&x->fir_lock);
 
     t_fir *firL = &x->firL[inactive];
     t_fir *firR = &x->firR[inactive];
@@ -837,19 +837,19 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
     fir_make_lowpass(firL, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
     fir_make_lowpass(firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
 
-    critical_enter(x->fir_lock);
+    critical_enter(&x->fir_lock);
     if (!x->use_fir) {
         x->fir_dirty = 0;
         x->fir_ready = 0;
         x->fir_swap_pending = 0;
-        critical_exit(x->fir_lock);
+        critical_exit(&x->fir_lock);
         return;
     }
     x->fir_pending = inactive;
     x->fir_swap_pending = 1;
     x->fir_ready = 1;
     x->fir_dirty = 0;
-    critical_exit(x->fir_lock);
+    critical_exit(&x->fir_lock);
 }
 
 void wombifier_fir_qfn(t_wombifier *x) {
@@ -940,7 +940,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
     t_fir *firR = NULL;
     int fir_ready = 0;
     if (x->use_fir) {
-        critical_enter(x->fir_lock);
+        critical_enter(&x->fir_lock);
         if (x->fir_swap_pending) {
             x->fir_active = x->fir_pending;
             x->fir_swap_pending = 0;
@@ -949,7 +949,7 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         firL = &x->firL[active];
         firR = &x->firR[active];
         fir_ready = (x->fir_ready && firL->taps && firR->taps && firL->ntaps > 0 && firR->ntaps > 0);
-        critical_exit(x->fir_lock);
+        critical_exit(&x->fir_lock);
     }
 
     for (long i = 0; i < n; ++i) {
@@ -1001,33 +1001,45 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
             sR = biquad_process(&x->lpfR, sR);
         }
 
-        // Watery (modulated short delay/chorus) — simmetrico con width=0
+        // Watery Mid/Side: modula SOLO la componente Side (S). Mid (M) resta centrata.
         if (water > 1e-5) {
-            double depth_samps = (0.25 + 0.75 * water) * 0.5 * base_samps;
+            double depth_samps   = (0.25 + 0.75 * water) * 0.5 * base_samps;
             double stereo_offset = stereo_samps * 0.5;
             if (stereo_offset > base_samps - 1.0) stereo_offset = base_samps - 1.0;
 
-            double delayL = base_samps - stereo_offset + sin(2.0 * M_PI * lfoL) * depth_samps;
-            double delayR = base_samps + stereo_offset + sin(2.0 * M_PI * lfoR) * depth_samps;
+            // split M/S
+            double M = 0.5 * (sL + sR);
+            double S = 0.5 * (sL - sR);
 
-            double tapL = tap_delay(x->dlyL, size, wr, delayL);
-            double tapR = tap_delay(x->dlyR, size, wr, delayR);
+            // delay su S con offset speculare e micro-detune
+            double delaySL = base_samps - stereo_offset + sin(2.0 * M_PI * lfoL) * depth_samps;
+            double delaySR = base_samps + stereo_offset + sin(2.0 * M_PI * lfoR) * depth_samps;
+            double tapSL = tap_delay(x->dlyL, size, wr, delaySL);
+            double tapSR = tap_delay(x->dlyR, size, wr, delaySR);
 
+            // mix dry/wet su S (normalizzato per non gonfiare/abbassare livello)
             double theta = water * (M_PI * 0.5);
-            double dryg  = cos(theta);
-            double wetg  = sin(theta);
-            double wetL = dryg * sL + wetg * tapL;
-            double wetR = dryg * sR + wetg * tapR;
+            double dryg  = cos(theta), wetg = sin(theta);
+            double SprocL = (dryg * S + wetg * tapSL);
+            double SprocR = (dryg * S + wetg * tapSR);
             double norm = 1.0 / hypot(dryg, wetg);
-            wetL *= norm;
-            wetR *= norm;
+            SprocL *= norm; SprocR *= norm;
 
-            x->dlyL[wr] = sL + tapL * feedback;
-            x->dlyR[wr] = sR + tapR * feedback;
+            // feedback SOLO in S (arricchisce senza spostare il centro)
+            x->dlyL[wr] = S + tapSL * feedback;
+            x->dlyR[wr] = S + tapSR * feedback;
 
-            sL = wetL; sR = wetR;
+            // recombine M/S -> L/R
+            sL = M + SprocL;
+            sR = M - SprocR;
         } else {
-            x->dlyL[wr] = sL; x->dlyR[wr] = sR;
+            // water=0: mantieni "caldi" i buffer senza modificare il segnale
+            double M = 0.5 * (sL + sR);
+            double S = 0.5 * (sL - sR);
+            x->dlyL[wr] = S;
+            x->dlyR[wr] = S;
+            sL = M + S;
+            sR = M - S;
         }
 
         wr++; if (wr >= size) wr = 0;
@@ -1079,6 +1091,12 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         if (inst_pow > safety_pow) {
             double scale = sqrt(safety_pow / inst_pow);
             sL *= scale; sR *= scale;
+        }
+
+        double peak = fmax(fabs(sL), fabs(sR));
+        if (peak > 0.99) {
+            double k = 0.99 / peak;
+            sL *= k; sR *= k;
         }
 
         // wet/dry + clamp
