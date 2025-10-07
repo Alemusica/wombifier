@@ -102,9 +102,10 @@ typedef struct _resonator {
 } t_resonator;
 
 static void resonator_init(t_resonator *r, double sr) {
-    double freqs[3] = {200.0, 400.0, 600.0};
-    double qs[3]    = {4.0,   3.5,   3.0};
-    double gains[3] = {1.0,   0.7,   0.5};
+    double f0 = 190.0;
+    double freqs[3] = {2.0 * f0, 3.0 * f0, 5.0 * f0};
+    double qs[3]    = {3.5,      3.2,      2.8};
+    double gains[3] = {1.0,      0.7,      0.5};
     for (int i = 0; i < 3; i++) {
         biquad_set_bp(&r->bands[i], sr, freqs[i], qs[i]);
         r->gains[i] = gains[i];
@@ -388,8 +389,6 @@ typedef struct _wombifier {
     long dly_size;
     long wr_idx;
     double lfoL, lfoR;
-
-    char  in_connected[2]; // signal inlet connection flags
 
     // resonators
     t_resonator resL, resR;
@@ -688,7 +687,7 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     x->sr        = sys_getsr(); if (x->sr <= 0) x->sr = 48000.0;
     x->bpm       = 72.0;
     x->depth     = 0.6;
-    x->cutoff    = 700.0;  // più realistico per occlusione
+    x->cutoff    = 400.0;  // più aderente alle attenuazioni in letteratura
     x->q         = 1.2;
     x->noise_amt = 0.15;
     x->wet       = 1.0;
@@ -735,8 +734,12 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     // research-based filters prepared (OFF by default)
     biquad_set_womb_response(&x->mtf_filter[0], x->sr);
     biquad_set_womb_response(&x->mtf_filter[1], x->sr);
+    biquad_clear(&x->mtf_filter[0]);
+    biquad_clear(&x->mtf_filter[1]);
     biquad_set_maternal_voice(&x->voice_enhance[0], x->sr);
     biquad_set_maternal_voice(&x->voice_enhance[1], x->sr);
+    biquad_clear(&x->voice_enhance[0]);
+    biquad_clear(&x->voice_enhance[1]);
     x->mtf_on = 0;
     x->mvoice_on = 0;
 
@@ -752,7 +755,6 @@ void *wombifier_new(t_symbol *s, long argc, t_atom *argv) {
     // delay
     x->dlyL = x->dlyR = NULL; x->dly_size = 0; x->wr_idx = 0;
     x->lfoL = 0.0; x->lfoR = 0.0; // stesse fasi per simmetria
-    x->in_connected[0] = x->in_connected[1] = 0;
     ensure_delay(x);
 
     // FIR defaults — già pronti per "filtro numeri primi"
@@ -786,7 +788,7 @@ void wombifier_free(t_wombifier *x) {
         fir_free(&x->firR[i]);
     }
     if (x->fir_qelem) qelem_free(x->fir_qelem);
-    critical_free(x->fir_lock);
+    critical_free(&x->fir_lock);
     dsp_free((t_pxobject *)x);
 }
 
@@ -858,12 +860,6 @@ void wombifier_fir_qfn(t_wombifier *x) {
 void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double samplerate,
                      long maxvectorsize, long flags) {
     double prev_sr = x->sr;
-    if (count) {
-        x->in_connected[0] = (char)(count[0] != 0);
-        x->in_connected[1] = (char)(count[1] != 0);
-    } else {
-        x->in_connected[0] = x->in_connected[1] = 0;
-    }
     if (samplerate > 0 && samplerate != x->sr) {
         x->sr = samplerate;
         x->noise_g = 1.0 - exp(-2.0 * M_PI * (300.0 / x->sr));
@@ -873,8 +869,12 @@ void wombifier_dsp64(t_wombifier *x, t_object *dsp64, short *count, double sampl
         resonator_init(&x->resR, x->sr);
         biquad_set_womb_response(&x->mtf_filter[0], x->sr);
         biquad_set_womb_response(&x->mtf_filter[1], x->sr);
+        biquad_clear(&x->mtf_filter[0]);
+        biquad_clear(&x->mtf_filter[1]);
         biquad_set_maternal_voice(&x->voice_enhance[0], x->sr);
         biquad_set_maternal_voice(&x->voice_enhance[1], x->sr);
+        biquad_clear(&x->voice_enhance[0]);
+        biquad_clear(&x->voice_enhance[1]);
         x->coeffs_dirty = 1;
         x->fir_dirty = 1;
     } else if (samplerate > 0) {
@@ -964,8 +964,10 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
         double mod = (1.0 - depth) + depth * env;
 
         // input
-        double l = inL ? inL[i] : 0.0;
-        double r = (x->in_connected[1] && inR) ? inR[i] : l;
+        const double in_l = inL ? inL[i] : 0.0;
+        const double in_r = inR ? inR[i] : in_l;
+        double l = in_l;
+        double r = in_r;
 
         if (x->mono) {
             double m = 0.5 * (l + r);
@@ -1016,6 +1018,9 @@ void wombifier_perform64(t_wombifier *x, t_object *dsp64, double **ins, long num
             double wetg  = sin(theta);
             double wetL = dryg * sL + wetg * tapL;
             double wetR = dryg * sR + wetg * tapR;
+            double norm = 1.0 / hypot(dryg, wetg);
+            wetL *= norm;
+            wetR *= norm;
 
             x->dlyL[wr] = sL + tapL * feedback;
             x->dlyR[wr] = sR + tapR * feedback;
