@@ -64,9 +64,10 @@ static void biquad_set_bp(t_biquad *b, double sr, double fc, double q) {
     double sinw0 = sin(w0);
     double alpha = sinw0 / (2.0 * q);
 
-    double b0 = q * alpha;   // = sin(w0)/2
+    // Constant-skirt RBJ bandpass: peak gain equals Q
+    double b0 = alpha;
     double b1 = 0.0;
-    double b2 = -q * alpha;
+    double b2 = -alpha;
     double a0 = 1.0 + alpha;
     double a1 = -2.0 * cosw0;
     double a2 = 1.0 - alpha;
@@ -827,6 +828,7 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
     }
 
     inactive = x->fir_active ^ 1;
+    int active = x->fir_active;
     critical_exit(&x->fir_lock);
 
     t_fir *firL = &x->firL[inactive];
@@ -838,6 +840,19 @@ static void fir_rebuild_if_needed(t_wombifier *x) {
     fir_make_lowpass(firR, x->sr, x->cutoff, (int)x->fir_prime, x->fir_asym, (int)x->fir_energy_norm);
 
     critical_enter(&x->fir_lock);
+    // Copy existing FIR history into the rebuilt filter to prevent swap transients
+    {
+        int nL = (x->firL[inactive].buf_cap < x->firL[active].buf_cap) ? x->firL[inactive].buf_cap : x->firL[active].buf_cap;
+        int nR = (x->firR[inactive].buf_cap < x->firR[active].buf_cap) ? x->firR[inactive].buf_cap : x->firR[active].buf_cap;
+        if (nL > 0 && x->firL[inactive].buf && x->firL[active].buf) {
+            memcpy(x->firL[inactive].buf, x->firL[active].buf, sizeof(double) * nL);
+            x->firL[inactive].idx = x->firL[active].idx % x->firL[inactive].ntaps;
+        }
+        if (nR > 0 && x->firR[inactive].buf && x->firR[active].buf) {
+            memcpy(x->firR[inactive].buf, x->firR[active].buf, sizeof(double) * nR);
+            x->firR[inactive].idx = x->firR[active].idx % x->firR[inactive].ntaps;
+        }
+    }
     if (!x->use_fir) {
         x->fir_dirty = 0;
         x->fir_ready = 0;
@@ -1130,6 +1145,10 @@ void wombifier_anything(t_wombifier *x, t_symbol *s, long argc, t_atom *argv) {
 
     if (!strcmp(name, "cutoff") && argc)      { wombifier_set_cutoff(x, NULL, 1, argv); return; }
     if (!strcmp(name, "q") && argc)           { wombifier_set_q(x, NULL, 1, argv); return; }
+    if (!strcmp(name, "bpm") && argc)         { object_attr_setvalueof((t_object*)x, gensym("bpm"), 1, argv); return; }
+    if (!strcmp(name, "depth") && argc)       { object_attr_setvalueof((t_object*)x, gensym("depth"), 1, argv); return; }
+    if (!strcmp(name, "wet") && argc)         { object_attr_setvalueof((t_object*)x, gensym("wet"), 1, argv); return; }
+    if (!strcmp(name, "noise") && argc)       { object_attr_setvalueof((t_object*)x, gensym("noise"), 1, argv); return; }
 
     if (!strcmp(name, "fir") && argc)         { object_attr_setvalueof((t_object*)x, gensym("fir"), 1, argv); return; }
     if (!strcmp(name, "fir_prime") && argc)   { wombifier_set_fir_prime(x, NULL, 1, argv); return; }
